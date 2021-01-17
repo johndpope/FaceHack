@@ -15,7 +15,9 @@ import threading
 import six.moves.queue as Queue # pylint: disable=import-error
 import traceback
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tensorflow
+tf = tensorflow
+tf.disable_v2_behavior()
 import PIL.Image
 import dnnlib.tflib as tflib
 

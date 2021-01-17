@@ -1,5 +1,7 @@
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tensorflow
+tf = tensorflow
+tf.disable_v2_behavior()
 from keras.models import Model
 from keras.applications.vgg16 import VGG16, preprocess_input
 from keras.preprocessing import image

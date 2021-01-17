@@ -6,7 +6,9 @@ import dnnlib
 import dnnlib.tflib as tflib
 import pickle
 import time
-import tensorflow as tf
+import tensorflow.compat.v1 as tensorflow
+tf = tensorflow
+tf.disable_v2_behavior()
 import urllib
 import imageio
 import os

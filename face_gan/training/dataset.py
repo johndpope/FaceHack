@@ -1,20 +1,23 @@
-# Copyright (c) 2019, NVIDIA Corporation. All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
-# This work is made available under the Nvidia Source Code License-NC.
-# To view a copy of this license, visit
-# https://nvlabs.github.io/stylegan2/license.html
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-"""Multi-resolution input data pipeline."""
+"""Streaming images and labels from dataset created with dataset_tool.py."""
 
 import os
 import glob
 import numpy as np
-import tensorflow as tf
-import dnnlib
+import tensorflow.compat.v1 as tensorflow
+tf = tensorflow
+tf.disable_v2_behavior()
 import dnnlib.tflib as tflib
 
 #----------------------------------------------------------------------------
-# Dataset class that loads data from tfrecords files.
+# Dataset class that loads images from tfrecords files.
 
 class TFRecordDataset:
     def __init__(self,
@@ -23,21 +26,32 @@ class TFRecordDataset:
         label_file      = None,     # Relative path of the labels file, None = autodetect.
         max_label_size  = 0,        # 0 = no labels, 'full' = full labels, <int> = N first label components.
         max_images      = None,     # Maximum number of images to use, None = use all images.
+        max_validation  = 10000,    # Maximum size of the validation set, None = use all available images.
+        mirror_augment  = False,    # Apply mirror augment?
+        mirror_augment_v= False,    # Apply mirror augment vertically?
         repeat          = True,     # Repeat dataset indefinitely?
+        shuffle         = True,     # Shuffle images?
         shuffle_mb      = 4096,     # Shuffle data within specified window (megabytes), 0 = disable shuffling.
         prefetch_mb     = 2048,     # Amount of data to prefetch (megabytes), 0 = disable prefetching.
         buffer_mb       = 256,      # Read buffer size (megabytes).
-        num_threads     = 2):       # Number of concurrent threads.
-
+        num_threads     = 2,        # Number of concurrent threads.
+        _is_validation  = False,
+        use_raw=False,
+):
         self.tfrecord_dir       = tfrecord_dir
         self.resolution         = None
         self.resolution_log2    = None
         self.shape              = []        # [channels, height, width]
         self.dtype              = 'uint8'
-        self.dynamic_range      = [0, 255]
         self.label_file         = label_file
         self.label_size         = None      # components
         self.label_dtype        = None
+        self.has_validation_set = None
+        self.mirror_augment     = mirror_augment
+        self.mirror_augment_v   = mirror_augment_v
+        self.repeat             = repeat
+        self.shuffle            = shuffle
+        self._max_validation    = max_validation
         self._np_labels         = None
         self._tf_minibatch_in   = None
         self._tf_labels_var     = None
@@ -49,20 +63,28 @@ class TFRecordDataset:
         self._cur_minibatch     = -1
         self._cur_lod           = -1
 
-        # List tfrecords files and inspect their shapes.
+        # List files in the dataset directory.
         assert os.path.isdir(self.tfrecord_dir)
-        tfr_files = sorted(glob.glob(os.path.join(self.tfrecord_dir, '*.tfrecords')))
+        all_files = sorted(glob.glob(os.path.join(self.tfrecord_dir, '*')))
+        self.has_validation_set = (self._max_validation > 0) and any(os.path.basename(f).startswith('validation-') for f in all_files)
+        all_files = [f for f in all_files if os.path.basename(f).startswith('validation-') == _is_validation]
+
+        # Inspect tfrecords files.
+        tfr_files = [f for f in all_files if f.endswith('.tfrecords')]
         assert len(tfr_files) >= 1
         tfr_shapes = []
         for tfr_file in tfr_files:
             tfr_opt = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.NONE)
             for record in tf.python_io.tf_record_iterator(tfr_file, tfr_opt):
-                tfr_shapes.append(self.parse_tfrecord_np(record).shape)
+                if use_raw:
+                    tfr_shapes.append(self.parse_tfrecord_np_raw(record))
+                else:
+                    tfr_shapes.append(self.parse_tfrecord_np(record).shape)
                 break
 
         # Autodetect label filename.
         if self.label_file is None:
-            guess = sorted(glob.glob(os.path.join(self.tfrecord_dir, '*.labels')))
+            guess = [f for f in all_files if f.endswith('.labels')]
             if len(guess):
                 self.label_file = guess[0]
         elif not os.path.isfile(self.label_file):
@@ -79,7 +101,8 @@ class TFRecordDataset:
         assert all(shape[0] == max_shape[0] for shape in tfr_shapes)
         assert all(shape[1] == shape[2] for shape in tfr_shapes)
         assert all(shape[1] == self.resolution // (2**lod) for shape, lod in zip(tfr_shapes, tfr_lods))
-        assert all(lod in tfr_lods for lod in range(self.resolution_log2 - 1))
+        # Breaks raw functions
+        # assert all(lod in tfr_lods for lod in range(self.resolution_log2 - 1))
 
         # Load labels.
         assert max_label_size == 'full' or max_label_size >= 0
@@ -95,22 +118,29 @@ class TFRecordDataset:
         self.label_dtype = self._np_labels.dtype.name
 
         # Build TF expressions.
-        with tf.name_scope('Dataset'), tf.device('/cpu:0'):
+        with tf.name_scope('Dataset'), tf.device('/cpu:0'), tf.control_dependencies(None):
             self._tf_minibatch_in = tf.placeholder(tf.int64, name='minibatch_in', shape=[])
             self._tf_labels_var = tflib.create_var_with_large_initial_value(self._np_labels, name='labels_var')
             self._tf_labels_dataset = tf.data.Dataset.from_tensor_slices(self._tf_labels_var)
             for tfr_file, tfr_shape, tfr_lod in zip(tfr_files, tfr_shapes, tfr_lods):
                 if tfr_lod < 0:
                     continue
-                dset = tf.data.TFRecordDataset(tfr_file, compression_type='', buffer_size=buffer_mb<<20)
+
+                tfr_file = tfr_files[-1]  # should be the highest resolution tf_record file
+                tfr_shape = tfr_shapes[-1]  # again the highest resolution shape
+                dset = tf.data.TFRecordDataset(tfr_file, compression_type="", buffer_size=buffer_mb<< 20)
                 if max_images is not None:
                     dset = dset.take(max_images)
-                dset = dset.map(self.parse_tfrecord_tf, num_parallel_calls=num_threads)
+                if use_raw:
+                    dset = dset.map(self.parse_tfrecord_tf_raw, num_parallel_calls=num_threads)
+                else:
+                    dset = dset.map(self.parse_tfrecord_tf, num_parallel_calls=num_threads)
                 dset = tf.data.Dataset.zip((dset, self._tf_labels_dataset))
+
                 bytes_per_item = np.prod(tfr_shape) * np.dtype(self.dtype).itemsize
-                if shuffle_mb > 0:
+                if self.shuffle and shuffle_mb > 0:
                     dset = dset.shuffle(((shuffle_mb << 20) - 1) // bytes_per_item + 1)
-                if repeat:
+                if self.repeat:
                     dset = dset.repeat()
                 if prefetch_mb > 0:
                     dset = dset.prefetch(((prefetch_mb << 20) - 1) // bytes_per_item + 1)
@@ -129,19 +159,31 @@ class TFRecordDataset:
         if self._cur_minibatch != minibatch_size or self._cur_lod != lod:
             self._tf_init_ops[lod].run({self._tf_minibatch_in: minibatch_size})
             self._cur_minibatch = minibatch_size
-            self._cur_lod = lod
+            # breaks raw loading?
+            #self._cur_lod = lod
 
     # Get next minibatch as TensorFlow expressions.
-    def get_minibatch_tf(self): # => images, labels
-        return self._tf_iterator.get_next()
+    def get_minibatch_tf(self):
+        images, labels = self._tf_iterator.get_next()
+        if self.mirror_augment or self.mirror_augment_v:
+            images = tf.cast(images, tf.float32)
+            if self.mirror_augment:
+                images = tf.where(tf.random_uniform([tf.shape(images)[0]]) < 0.5, images, tf.reverse(images, [3]))
+            if self.mirror_augment_v:
+                images = tf.where(tf.random_uniform([tf.shape(images)[0]]) < 0.5, images, tf.reverse(images, [2]))
+            images = tf.cast(images, self.dtype)
+        return images, labels
 
     # Get next minibatch as NumPy arrays.
-    def get_minibatch_np(self, minibatch_size, lod=0): # => images, labels
+    def get_minibatch_np(self, minibatch_size, lod=0): # => (images, labels) or (None, None)
         self.configure(minibatch_size, lod)
-        with tf.name_scope('Dataset'):
-            if self._tf_minibatch_np is None:
+        if self._tf_minibatch_np is None:
+            with tf.name_scope('Dataset'):
                 self._tf_minibatch_np = self.get_minibatch_tf()
+        try:
             return tflib.run(self._tf_minibatch_np)
+        except tf.errors.OutOfRangeError:
+            return None, None
 
     # Get random labels as TensorFlow expression.
     def get_random_labels_tf(self, minibatch_size): # => labels
@@ -157,6 +199,28 @@ class TFRecordDataset:
             return self._np_labels[np.random.randint(self._np_labels.shape[0], size=[minibatch_size])]
         return np.zeros([minibatch_size, 0], self.label_dtype)
 
+    # Load validation set as NumPy array.
+    def load_validation_set_np(self):
+        images = []
+        labels = []
+        if self.has_validation_set:
+            validation_set = TFRecordDataset(
+                tfrecord_dir=self.tfrecord_dir, resolution=self.shape[2], max_label_size=self.label_size,
+                max_images=self._max_validation, repeat=False, shuffle=False, prefetch_mb=0, _is_validation=True)
+            validation_set.configure(1)
+            while True:
+                image, label = validation_set.get_minibatch_np(1)
+                if image is None:
+                    break
+                images.append(image)
+                labels.append(label)
+        images = np.concatenate(images, axis=0) if len(images) else np.zeros([0] + self.shape, dtype=self.dtype)
+        labels = np.concatenate(labels, axis=0) if len(labels) else np.zeros([0, self.label_size], self.label_dtype)
+        assert list(images.shape[1:]) == self.shape
+        assert labels.shape[1] == self.label_size
+        assert images.shape[0] <= self._max_validation
+        return images, labels
+
     # Parse individual image from a tfrecords file into TensorFlow expression.
     @staticmethod
     def parse_tfrecord_tf(record):
@@ -165,6 +229,17 @@ class TFRecordDataset:
             'data': tf.FixedLenFeature([], tf.string)})
         data = tf.decode_raw(features['data'], tf.uint8)
         return tf.reshape(data, features['shape'])
+
+    @staticmethod
+    def parse_tfrecord_tf_raw(record):
+        features = tf.parse_single_example(record, 
+            features={
+                "shape": tf.FixedLenFeature([3], tf.int64),
+                "img": tf.FixedLenFeature([], tf.string),
+            }
+        )
+        image = tf.image.decode_image(features['img']) 
+        return tf.transpose(image, [2,0,1]) 
 
     # Parse individual image from a tfrecords file into NumPy array.
     @staticmethod
@@ -175,25 +250,27 @@ class TFRecordDataset:
         data = ex.features.feature['data'].bytes_list.value[0] # pylint: disable=no-member
         return np.fromstring(data, np.uint8).reshape(shape)
 
+    @staticmethod
+    def parse_tfrecord_np_raw(record):
+        ex = tf.train.Example()
+        ex.ParseFromString(record)
+        shape = ex.features.feature[
+            "shape"
+        ].int64_list.value  # temporary pylint workaround # pylint: disable=no-member
+        img = ex.features.feature["img"].bytes_list.value[
+            0
+        ]  # temporary pylint workaround # pylint: disable=no-member
+        return shape
+
 #----------------------------------------------------------------------------
-# Helper func for constructing a dataset object using the given options.
+# Construct a dataset object using the given options.
 
-def load_dataset(class_name=None, data_dir=None, verbose=False, **kwargs):
-    kwargs = dict(kwargs)
-    if 'tfrecord_dir' in kwargs:
-        if class_name is None:
-            class_name = __name__ + '.TFRecordDataset'
-        if data_dir is not None:
-            kwargs['tfrecord_dir'] = os.path.join(data_dir, kwargs['tfrecord_dir'])
-
-    assert class_name is not None
-    if verbose:
-        print('Streaming data using %s...' % class_name)
-    dataset = dnnlib.util.get_obj_by_name(class_name)(**kwargs)
-    if verbose:
-        print('Dataset shape =', np.int32(dataset.shape).tolist())
-        print('Dynamic range =', dataset.dynamic_range)
-        print('Label size    =', dataset.label_size)
-    return dataset
+def load_dataset(path=None, use_raw=False, resolution=None, max_images=None, max_label_size=0, mirror_augment=False, mirror_augment_v=False, repeat=True, shuffle=True, seed=None):
+    _ = seed
+    assert os.path.isdir(path)
+    return TFRecordDataset(
+        tfrecord_dir=path, use_raw=use_raw,
+        resolution=resolution, max_images=max_images, max_label_size=max_label_size,
+        mirror_augment=mirror_augment, mirror_augment_v=mirror_augment_v, repeat=repeat, shuffle=shuffle)
 
 #----------------------------------------------------------------------------
