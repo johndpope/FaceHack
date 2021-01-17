@@ -431,13 +431,9 @@ class Network:
         build_module_src = state["build_module_src"]
         build_func_name = state["build_func_name"]
 
-        # the workaround of tf1 to tf2 migration in network pickle file
-        #	replace 'import tensorflow.compat.v1 as tensorflow
-tf = tensorflow
-tf.disable_v2_behavior()' in build_module_src
-        build_module_src =  build_module_src.replace('import tensorflow.compat.v1 as tensorflow
-tf = tensorflow
-tf.disable_v2_behavior()', 'import tensorflow.compat.v1 as tf\ntf.disable_v2_behavior()')
+          # the workaround of tf1 to tf2 migration in network pickle file
+        #	replace 'import tensorflow as tf' in build_module_src
+        build_module_src =  build_module_src.replace('import tensorflow as tf', 'import tensorflow.compat.v1 as tf\ntf.disable_v2_behavior()')
 
 
         # Create temporary module from the imported source code.

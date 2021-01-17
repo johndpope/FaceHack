@@ -11,7 +11,7 @@ st.title('欢迎使用海马云人脸图像生成平台')
 st.header('Face Hack Web App')
 
 npy_dir = './latent_representations/' + st.sidebar.selectbox('请选择要变化的图片:', os.listdir('./latent_representations/'), index=7)
-model_dir = './networks/'+st.sidebar.selectbox('请选择生成模型:', os.listdir('./networks/'), index=2)
+model_dir = './networks/generator_model-stylegan2-config-f.pkl'
 save = st.sidebar.checkbox('生成随机人脸的同时保存它的掩码')
 
 smile = st.sidebar.slider('控制微笑程度:', -30.0, 30.0, 0.0, 0.1)
@@ -96,11 +96,11 @@ def random_generate_demo():
 
 if __name__ == '__main__':
 
-    if randome_generate:
-        image = random_generate_demo()
-        st.image(image, caption='生成结果', use_column_width=True)
-    if not run:
-        pass
-    else:
-        image = demo()
-        st.image(image, caption='生成结果', use_column_width=True)
+    # if randome_generate:
+    #     image = random_generate_demo()
+    #     st.image(image, caption='生成结果', use_column_width=True)
+    # if not run:
+    #     pass
+    # else:
+    image = demo()
+    st.image(image, caption='生成结果', use_column_width=True)
